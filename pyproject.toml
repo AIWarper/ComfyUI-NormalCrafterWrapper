@@ -1,0 +1,15 @@
+[project]
+name = "normalcrafterwrapper"
+description = "ComfyUI diffusers wrapper nodes for [a/NormalCrafter](https://github.com/Binyr/NormalCrafter)"
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["mediapy", "decord", "# diffusers", "# If you do not have diffusers installed, you need to install it.", "# You can typically install a compatible version by running the following command inside your activated VENV:", "# pip install diffusers", "# Repeat this process for any other packages you may be missing that show as errors during bootup or runtime"]
+
+[project.urls]
+Repository = "https://github.com/AIWarper/ComfyUI-NormalCrafterWrapper"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-NormalCrafterWrapper"
+Icon = ""
