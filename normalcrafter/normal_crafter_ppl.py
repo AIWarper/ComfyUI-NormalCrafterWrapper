@@ -18,144 +18,99 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 class NormalCrafterPipeline(StableVideoDiffusionPipeline):
 
-    def _encode_image(self, image, device, num_videos_per_prompt, do_classifier_free_guidance, scale=1, image_size=None):
+    def _encode_image(self, image: torch.Tensor, device, num_videos_per_prompt, do_classifier_free_guidance, scale=1, image_size=None):
         dtype = next(self.image_encoder.parameters()).dtype
 
-        if not isinstance(image, torch.Tensor):
-            image = self.video_processor.pil_to_numpy(image) # (0, 255) -> (0, 1)
-            image = self.video_processor.numpy_to_pt(image) # (n, h, w, c) -> (n, c, h, w)
+        if isinstance(image, torch.Tensor):
+            # Expected: (T,H,W,C) or (T,C,H,W) in [0,1]
+            if image.dim() != 4:
+                raise ValueError("Tensor image must be 4D (T,H,W,C) or (T,C,H,W).")
+            if image.shape[-1] == 3:        # (T,H,W,C) -> (T,C,H,W)
+                image = image.permute(0,3,1,2)
+            elif image.shape[1] == 3:       # (T,C,H,W)
+                pass
+            else:
+                raise ValueError("Channel dim must be 3.")
 
-            # We normalize the image before resizing to match with the original implementation.
-            # Then we unnormalize it after resizing.
-            pixel_values = image
+            pixel_values = image.to(device=device, dtype=torch.float32)  # B=T
             B, C, H, W = pixel_values.shape
+
             patches = [pixel_values]
-            # patches = []
             for i in range(1, scale):
-                num_patches_HW_this_level = i + 1
-                patch_H = H // num_patches_HW_this_level + 1
-                patch_W = W // num_patches_HW_this_level + 1
-                for j in range(num_patches_HW_this_level):
-                    for k in range(num_patches_HW_this_level):
-                        patches.append(pixel_values[:, :, j*patch_H:(j+1)*patch_H, k*patch_W:(k+1)*patch_W])
+                num_patches = i + 1
+                ph = H // num_patches + 1
+                pw = W // num_patches + 1
+                for j in range(num_patches):
+                    for k in range(num_patches):
+                        patches.append(pixel_values[:, :, j*ph:(j+1)*ph, k*pw:(k+1)*pw])
+
+            def encode_image(img_bchw):
+                img_bchw = img_bchw * 2.0 - 1.0
+                img_bchw = _resize_with_antialiasing(img_bchw, image_size or (224, 224))
+                img_bchw = (img_bchw + 1.0) / 2.0  # zurück in [0,1]
+
+                # CLIP-Preproc
+                feat = self.feature_extractor(
+                    images=img_bchw, do_normalize=True, do_center_crop=False,
+                    do_resize=False, do_rescale=False, return_tensors="pt",
+                ).pixel_values.to(device=device, dtype=dtype)
+
+                emb = self.image_encoder(feat).image_embeds
+                if emb.dim() < 3:
+                    emb = emb.unsqueeze(1)
+                return emb
+
+            image_embeddings = torch.cat([encode_image(p) for p in patches], dim=1)
+        else:
+            raise ValueError("_encode_image() didn't get handed a torch-tensor")
             
-            def encode_image(image):
-                image = image * 2.0 - 1.0
-                if image_size is not None:
-                    image = _resize_with_antialiasing(image, image_size)
-                else:
-                    image = _resize_with_antialiasing(image, (224, 224))
-                image = (image + 1.0) / 2.0
-
-                # Normalize the image with for CLIP input
-                image = self.feature_extractor(
-                    images=image,
-                    do_normalize=True,
-                    do_center_crop=False,
-                    do_resize=False,
-                    do_rescale=False,
-                    return_tensors="pt",
-                ).pixel_values
-
-                image = image.to(device=device, dtype=dtype)
-                image_embeddings = self.image_encoder(image).image_embeds
-                if len(image_embeddings.shape) < 3:
-                    image_embeddings = image_embeddings.unsqueeze(1)
-                return image_embeddings
-
-            image_embeddings = []
-            for patch in patches:
-                image_embeddings.append(encode_image(patch))
-            image_embeddings = torch.cat(image_embeddings, dim=1)    
-        
-        # duplicate image embeddings for each generation per prompt, using mps friendly method
-        # import pdb
-        # pdb.set_trace()
+        # Duplicate
         bs_embed, seq_len, _ = image_embeddings.shape
         image_embeddings = image_embeddings.repeat(1, num_videos_per_prompt, 1)
         image_embeddings = image_embeddings.view(bs_embed * num_videos_per_prompt, seq_len, -1)
 
         if do_classifier_free_guidance:
-            negative_image_embeddings = torch.zeros_like(image_embeddings)
-
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
-            # to avoid doing two forward passes
-            image_embeddings = torch.cat([negative_image_embeddings, image_embeddings])
+            negative = torch.zeros_like(image_embeddings)
+            image_embeddings = torch.cat([negative, image_embeddings])
 
         return image_embeddings
 
-    def ecnode_video_vae(self, images, chunk_size: int = 14):
-        if isinstance(images, list):
-            width, height = images[0].size
-        else:
-            height, width = images[0].shape[:2]
+
+    def encode_video_vae(self, images: torch.Tensor, chunk_size: int = 14):
         needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
         if needs_upcasting:
             self.vae.to(dtype=torch.float32)
 
         device = self._execution_device
-        images = self.video_processor.preprocess_video(images, height=height, width=width).to(device, self.vae.dtype) # torch type in range(-1, 1) with (1,3,h,w)
-        images = images.squeeze(0) # from (1, c, t, h, w) -> (c, t, h, w)
-        images = images.permute(1,0,2,3) # c, t, h, w -> (t, c, h, w)
+
+        if isinstance(images, torch.Tensor):
+            # (T,H,W,C) oder (T,C,H,W) in [0,1] -> (1, C, T, H, W) in [-1,1]
+            if images.shape[-1] == 3:        # (T,H,W,C) -> (T,C,H,W)
+                imgs = images.permute(0,3,1,2)
+            else:                             # (T,C,H,W)
+                imgs = images
+            imgs = imgs.to(device=device, dtype=self.vae.dtype)
+            imgs = imgs * 2.0 - 1.0
+            imgs = imgs.permute(1,0,2,3).unsqueeze(0)  # (C,T,H,W) -> (1,C,T,H,W)
+        else:
+            raise ValueError("encode_video_vae() didn't get handed a torch-tensor") 
+
+        # (1,C,T,H,W) -> (C,T,H,W) -> (T,C,H,W)
+        imgs = imgs.squeeze(0).permute(1,0,2,3)
 
         video_latents = []
-        # chunk_size = 14
-        for i in range(0, images.shape[0], chunk_size):                
-            video_latents.append(self.vae.encode(images[i : i + chunk_size]).latent_dist.mode())
-        image_latents = torch.cat(video_latents)
+        for i in range(0, imgs.shape[0], chunk_size):
+            video_latents.append(self.vae.encode(imgs[i:i+chunk_size]).latent_dist.mode())
+        image_latents = torch.cat(video_latents, dim=0)
 
-        # cast back to fp16 if needed
         if needs_upcasting:
             self.vae.to(dtype=torch.float16)
-
         return image_latents
-
-    def pad_image(self, images, scale=64):
-        def get_pad(newW, W):
-            pad_W = (newW - W) // 2
-            if W % 2 == 1:
-                pad_Ws = [pad_W, pad_W + 1]
-            else:
-                pad_Ws = [pad_W, pad_W]
-            return pad_Ws
-
-        if type(images[0]) is np.ndarray:
-            H, W = images[0].shape[:2]
-        else:
-            W, H = images[0].size
-
-        if W % scale == 0 and H % scale == 0:
-            return images, None
-        newW = int(np.ceil(W / scale) * scale)
-        newH = int(np.ceil(H / scale) * scale)
-
-        pad_Ws = get_pad(newW, W)
-        pad_Hs = get_pad(newH, H)
-        
-        new_images = []
-        for image in images:
-            if type(image) is np.ndarray:
-                image = cv2.copyMakeBorder(image, *pad_Hs, *pad_Ws, cv2.BORDER_CONSTANT, value=(1.,1.,1.))
-                new_images.append(image)
-            else:
-                image = np.array(image)
-                image = cv2.copyMakeBorder(image, *pad_Hs, *pad_Ws, cv2.BORDER_CONSTANT, value=(255,255,255))
-                new_images.append(Image.fromarray(image))
-        return new_images, pad_Hs+pad_Ws
-    
-    def unpad_image(self, v, pad_HWs):
-        t, b, l, r = pad_HWs
-        if t > 0 or b > 0:
-            v = v[:, :, t:-b]
-        if l > 0 or r > 0:
-            v = v[:, :, :, l:-r]
-        return v
     
     @torch.no_grad()
     def __call__(
         self,
-        images: Union[PIL.Image.Image, List[PIL.Image.Image], torch.FloatTensor],
+        images: torch.FloatTensor,
         decode_chunk_size: Optional[int] = None,
         time_step_size: Optional[int] = 1,
         window_size: Optional[int] = 1,
@@ -165,14 +120,28 @@ class NormalCrafterPipeline(StableVideoDiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         return_dict: bool = True
     ):
-        images, pad_HWs = self.pad_image(images)
+        #images, pad_HWs = self.pad_image(images)
 
         # 0. Default height and width to unet
-        width, height = images[0].size
-        num_frames = len(images)
+        if isinstance(images, torch.Tensor):
+            if images.dim() != 4:
+                raise ValueError("images tensor must be 4D (T,H,W,C) or (T,C,H,W)")
+            if images.shape[-1] == 3:   # (T,H,W,C)
+                T, H, W, C = images.shape
+                images_for_enc = images.permute(0,3,1,2)  # (T,C,H,W)
+            elif images.shape[1] == 3:  # (T,C,H,W)
+                T, C, H, W = images.shape[0], images.shape[1], images.shape[2], images.shape[3]
+                images_for_enc = images
+            else:
+                raise ValueError("Channel dim must be 3.")
+            num_frames, height, width = T, H, W
+        else:
+            width, height = images[0].size
+            num_frames = len(images)
+            images_for_enc = images  # bleibt Liste von PIL
 
-        # 1. Check inputs. Raise error if not correct
-        self.check_inputs(images, height, width)
+        # 1. Check inputs. Raise error if not correct -> Redundant, due to the rescaling done in normal_crafter_node.py
+        # self.check_inputs(images, height, width) 
 
         # 2. Define call parameters
         batch_size = 1
@@ -186,7 +155,7 @@ class NormalCrafterPipeline(StableVideoDiffusionPipeline):
         num_inference_steps = 1 # For direct normal generation, this is typically 1 step if not iterative refinement
         # fps, motion_bucket_id, noise_aug_strength are now passed as arguments
 
-        output_type = "np" # Default output type from SVD pipeline is numpy array
+        output_type = "pt" # Default output type from SVD pipeline is numpy array, but we use torch because we are cooler
         # data_keys = ["normal"] # Not used directly in this simplified flow
         use_linear_merge = True
         determineTrain = True # This seems to indicate a direct generation rather than denoising from pure noise
@@ -198,7 +167,7 @@ class NormalCrafterPipeline(StableVideoDiffusionPipeline):
         # 3. Encode input image using using clip. (num_image * num_videos_per_prompt, 1, 1024)
         image_embeddings = self._encode_image(images, device, num_videos_per_prompt, do_classifier_free_guidance=do_classifier_free_guidance, scale=encode_image_scale, image_size=encode_image_WH)
         # 4. Encode input image using VAE
-        image_latents = self.ecnode_video_vae(images, chunk_size=decode_chunk_size).to(image_embeddings.dtype)
+        image_latents = self.encode_video_vae(images, chunk_size=decode_chunk_size).to(image_embeddings.dtype)
 
         # image_latents [num_frames, channels, height, width] ->[1, num_frames, channels, height, width]
         image_latents = image_latents.unsqueeze(0)
@@ -369,13 +338,12 @@ class NormalCrafterPipeline(StableVideoDiffusionPipeline):
 
 
                 frames_decoded = self.decode_latents(latents_to_decode, num_frames_to_decode, decode_chunk_size_local)
-                frames_decoded = self.video_processor.postprocess_video(video=frames_decoded, output_type="np")
+                frames_decoded = self.video_processor.postprocess_video(video=frames_decoded, output_type=output_type)  # "pt"
                 frames_decoded = frames_decoded * 2 - 1
                 return frames_decoded
 
             frames = decode_latents(pred, num_frames, decode_chunk_size)
-            if pad_HWs is not None:
-                frames = self.unpad_image(frames, pad_HWs)
+            
         else:
             frames = pred
 

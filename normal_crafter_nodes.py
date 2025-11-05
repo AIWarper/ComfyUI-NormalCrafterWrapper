@@ -2,6 +2,7 @@
 
 import torch
 import torchvision.transforms as transforms
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 import os
@@ -10,6 +11,7 @@ import logging
 import comfy.model_management
 import model_management
 import comfy.utils
+from comfy.utils import common_upscale
 import folder_paths # ComfyUI's way to get model paths
 
 # Handle PIL version compatibility
@@ -294,60 +296,34 @@ class NormalCrafterNode:
         print(f"ComfyUI-NormalCrafter: Pipeline loaded to {target_device_for_this_run} with dtype {final_torch_dtype_for_load}.")
         return self.pipe
 
-    def tensor_to_pil_list(self, images_tensor: torch.Tensor) -> list:
-        pil_images = []
-        for i in range(images_tensor.shape[0]):
-            img_np = (images_tensor[i].cpu().numpy() * 255).astype(np.uint8)
-            pil_images.append(Image.fromarray(img_np))
-        return pil_images
-
-    def _validate_dimensions_for_attention(self, width: int, height: int) -> tuple:
+    
+    def make_safe_size(self, images: torch.Tensor, max_res_dim: int, device: torch.device) -> torch.Tensor:
         """
-        Validates and adjusts dimensions to be compatible with flash attention requirements.
-        Returns (safe_width, safe_height, needs_adjustment) tuple.
+        Skaliert ein Batch von Bildern mit Torch, ohne PIL/NumPy,
+        und sorgt gleich für Attention-kompatible Dimensionen.
         """
-        # Flash attention typically requires dimensions divisible by 8 or 16
-        # and the total elements to be within certain bounds
-        
-        # After VAE encoding, dimensions will be divided by 8
-        latent_width = width // 8
-        latent_height = height // 8
-        
-        # Common constraints for flash attention
-        min_dim = 2  # Minimum dimension after encoding
-        alignment = 8  # Dimension alignment requirement
-        
-        # Check if dimensions are safe
-        if latent_width < min_dim or latent_height < min_dim:
-            # Dimensions too small
-            safe_width = max(width, min_dim * 8)
-            safe_height = max(height, min_dim * 8)
-            return safe_width, safe_height, True
-        
-        # Check alignment
-        if latent_width % alignment != 0 or latent_height % alignment != 0:
-            # Need alignment adjustment
-            safe_width = ((latent_width + alignment - 1) // alignment) * alignment * 8
-            safe_height = ((latent_height + alignment - 1) // alignment) * alignment * 8
-            return safe_width, safe_height, True
-            
-        return width, height, False
+        imgs = images.to(device, non_blocking=True).permute(0, 3, 1, 2)  # (B,C,H,W)
+        _, _, H, W = imgs.shape
 
-    def resize_pil_images(self, pil_images: list, max_res_dim: int) -> list:
-        resized_images = []
-        if not pil_images: return []
-        for img in pil_images:
-            original_width, original_height = img.size
-            if max(original_height, original_width) > max_res_dim:
-                scale = max_res_dim / max(original_height, original_width)
-                target_height = round(original_height * scale)
-                target_width = round(original_width * scale)
-            else:
-                target_height = original_height
-                target_width = original_width
-            resized_images.append(img.resize((target_width, target_height), LANCZOS))
-        return resized_images
+        # 1. Scale down to max_res_dim (if necessary
+        if max(H, W) > max_res_dim:
+            scale = max_res_dim / max(H, W)
+            target_h, target_w = int(round(H * scale)), int(round(W * scale))
+        else:
+            target_h, target_w = H, W
 
+        # 2. Enforce Attention-Safe-Dimension (minimum 64)
+        min_dim = 64
+        align = 64
+        target_h = max(min_dim, ((target_h + align - 1) // align) * align)
+        target_w = max(min_dim, ((target_w + align - 1) // align) * align)
+
+        # 3. Torch-Interpolation
+        imgs_resized = F.interpolate(imgs, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+        return imgs_resized.permute(0, 2, 3, 1).contiguous()
+
+    
     def process(self, images: torch.Tensor, seed: int, max_res_dimension: int,
                 window_size: int, time_step_size: int, decode_chunk_size: int,
                 offload_pipe_to_cpu_on_finish: bool, # <<< NEW PARAMETER
@@ -361,6 +337,7 @@ class NormalCrafterNode:
         if pipe_override is not None:
             self.pipe = pipe_override
             print("ComfyUI-NormalCrafter: Using provided pipe_override.")
+            
         else:
             current_comfy_device = comfy.model_management.get_torch_device()
             device_str = "cuda" if current_comfy_device.type == 'cuda' else "cpu"
@@ -370,7 +347,7 @@ class NormalCrafterNode:
 
         if self.pipe is None:
             raise RuntimeError("ComfyUI-NormalCrafter: Pipeline could not be loaded.")
-
+        
         # Ensure the pipe instance self.pipe is on the correct device for processing *before* using it
         # This is important if self.pipe came from the global cache and might have been on CPU
         processing_device = comfy.model_management.get_torch_device()
@@ -378,79 +355,54 @@ class NormalCrafterNode:
             print(f"ComfyUI-NormalCrafter: Moving self.pipe from {self.pipe.device} to {processing_device} for processing.")
             self.pipe.to(processing_device)
 
-
-        pil_frames = self.tensor_to_pil_list(images)
-        if not pil_frames: return (torch.zeros_like(images),)
-
-        resized_pil_frames = self.resize_pil_images(pil_frames, max_res_dimension)
+        #Resizing
+        orig_h, orig_w = images.shape[1:3]
+        resized_tensor = self.make_safe_size(images, max_res_dimension, processing_device)
         
-        num_actual_frames = len(resized_pil_frames)
-        effective_frames_for_pipeline = list(resized_pil_frames) 
+        orig_h, orig_w = images.shape[1:3]
+        resized_tensor = self.make_safe_size(images, max_res_dimension, processing_device)
+
+        # Get number of frames in the tensor
+        num_actual_frames = resized_tensor.shape[0]
+ 
+
 
         if num_actual_frames == 0:
              print("ComfyUI-NormalCrafter: Warning - No frames to process after resizing.")
              return (torch.zeros_like(images),)
 
+
         if num_actual_frames < window_size:
             print(f"ComfyUI-NormalCrafter: Number of frames ({num_actual_frames}) is less than window_size ({window_size}). Padding...")
             padding_needed = window_size - num_actual_frames
-            last_frame_to_duplicate = resized_pil_frames[-1] 
-            for _ in range(padding_needed):
-                effective_frames_for_pipeline.append(last_frame_to_duplicate)
+            last_frame = resized_tensor[-1:]  # Shape (1,H,W,C)
+            pad_frames = last_frame.repeat(padding_needed, 1, 1, 1)
+            effective_frames_for_pipeline = torch.cat([resized_tensor, pad_frames], dim=0)
+        else:
+            effective_frames_for_pipeline = resized_tensor
+
+        
         
         generator_device = self.pipe.device # Should be processing_device
         generator = torch.Generator(device=generator_device).manual_seed(seed)
 
-        print(f"ComfyUI-NormalCrafter: Processing {len(effective_frames_for_pipeline)} frames (effective) with seed {seed}. Original: {num_actual_frames}.")
+        effective_frame_count = effective_frames_for_pipeline.shape[0]
+
+        print(f"ComfyUI-NormalCrafter: Processing {effective_frame_count} frames (effective) with seed {seed}. Original: {num_actual_frames}.")
         print(f"ComfyUI-NormalCrafter: Using (internal defaults) fps={default_fps_for_time_ids}, motion_id={default_motion_bucket_id}, noise_aug={default_noise_aug_strength}")
 
-        pbar = comfy.utils.ProgressBar(len(effective_frames_for_pipeline)) # This pbar seems not used by the pipe.
+        pbar = comfy.utils.ProgressBar(effective_frame_count)  # optional, Pipe nutzt eh ihre eigene
 
-        # Check dimensions before processing
-        if resized_pil_frames:
-            first_frame_width, first_frame_height = resized_pil_frames[0].size
-            safe_width, safe_height, needs_adjustment = self._validate_dimensions_for_attention(first_frame_width, first_frame_height)
-            
-            if needs_adjustment and use_xformers != "force":
-                print(f"ComfyUI-NormalCrafter: Detected potentially problematic dimensions ({first_frame_width}x{first_frame_height}). "
-                      f"Adjusting to safe dimensions ({safe_width}x{safe_height}) for flash attention compatibility.")
-                # Re-resize ALL frames in effective_frames_for_pipeline to safe dimensions
-                # This ensures padded frames also get resized
-                for i in range(len(effective_frames_for_pipeline)):
-                    if isinstance(effective_frames_for_pipeline[i], Image.Image):
-                        effective_frames_for_pipeline[i] = effective_frames_for_pipeline[i].resize((safe_width, safe_height), LANCZOS)
-                    else:
-                        # Handle case where frame might not be a PIL Image
-                        print(f"ComfyUI-NormalCrafter: Warning - frame {i} is not a PIL Image, skipping resize")
 
-        # Final safety check: ensure all frames have the same dimensions
-        if effective_frames_for_pipeline:
-            reference_size = None
-            all_same_size = True
-            
-            for i, frame in enumerate(effective_frames_for_pipeline):
-                if isinstance(frame, Image.Image):
-                    if reference_size is None:
-                        reference_size = frame.size
-                    elif frame.size != reference_size:
-                        all_same_size = False
-                        print(f"ComfyUI-NormalCrafter: Frame {i} has size {frame.size}, expected {reference_size}")
-                        
-            if not all_same_size and reference_size:
-                print(f"ComfyUI-NormalCrafter: Ensuring all frames are {reference_size} for consistency")
-                for i in range(len(effective_frames_for_pipeline)):
-                    if isinstance(effective_frames_for_pipeline[i], Image.Image):
-                        if effective_frames_for_pipeline[i].size != reference_size:
-                            effective_frames_for_pipeline[i] = effective_frames_for_pipeline[i].resize(reference_size, LANCZOS)
 
-        output_frames_np = None
+        output_frames_pt = None
         error_occurred = False
         
         # Try processing with current settings
         try:
             with torch.inference_mode():
-                output_frames_np = self.pipe( # self.pipe should be on processing_device here
-                    images=effective_frames_for_pipeline,
+                output_frames_pt = self.pipe( # self.pipe should be on processing_device here
+                    images=resized_tensor,
                     decode_chunk_size=decode_chunk_size,
                     time_step_size=time_step_size,
                     window_size=window_size,
@@ -472,8 +424,8 @@ class NormalCrafterNode:
                     
                     try:
                         with torch.inference_mode():
-                            output_frames_np = self.pipe(
-                                images=effective_frames_for_pipeline,
+                            output_frames_pt = self.pipe(
+                                images=resized_tensor,
                                 decode_chunk_size=decode_chunk_size,
                                 time_step_size=time_step_size,
                                 window_size=window_size,
@@ -498,14 +450,29 @@ class NormalCrafterNode:
             else:
                 raise e
         
-        if output_frames_np is None:
+        if output_frames_pt is None:
             raise RuntimeError("ComfyUI-NormalCrafter: Failed to generate output frames.")
 
-        if len(effective_frames_for_pipeline) > num_actual_frames:
-            output_frames_np = output_frames_np[:num_actual_frames, :, :, :]
-        
-        output_normals_0_1 = (output_frames_np.clip(-1., 1.) * 0.5) + 0.5
-        output_tensor = torch.from_numpy(output_normals_0_1).float()
+        if len(resized_tensor) > num_actual_frames:
+            output_frames_pt = output_frames_pt[:num_actual_frames, ...]
+
+
+        # Output from NormalCrafter has the pattern: [B,C,H,W]
+        # 1. Normalize to a range of [0,1]
+        output_frames_pt = (output_frames_pt.clamp(-1., 1.) * 0.5) + 0.5
+
+        # 2. Resize back to input-resolution
+        output_frames_pt = F.interpolate(
+            output_frames_pt,
+            size=(orig_h, orig_w),   # Eingangsauflösung
+            mode="bilinear",
+            align_corners=False
+        )
+
+        # 3. Permute Tensor to [B,H,W,C] for ComfyUI-Compatibility
+        output_frames_pt = output_frames_pt.permute(0, 2, 3, 1).contiguous()
+
+
 
         # --- Explicit Offload After Processing ---
         # Only offload the globally managed pipe (NORMALCRAFTER_PIPE), not an overridden one.
@@ -527,5 +494,5 @@ class NormalCrafterNode:
             except Exception as e:
                 print(f"ComfyUI-NormalCrafter: Error offloading pipeline to CPU: {e}")
         
-        print(f"ComfyUI-NormalCrafter: Processing complete. Output tensor shape: {output_tensor.shape}")
-        return (output_tensor,)
+        print(f"ComfyUI-NormalCrafter: Processing complete. Output tensor shape: {output_frames_pt.shape}")
+        return (output_frames_pt,)
